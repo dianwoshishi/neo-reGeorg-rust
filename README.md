@@ -80,7 +80,7 @@ $$\frac{go}{rust}= \frac{5,742,080}{758,262} \approx 7.572$$
 因为内存有些是运行时分配的，因此不能仅仅简单对照程序启动时的内存。
 
 以下对比均在使用代理服务端**访问一次**目标[ziglang文档](https://ziglang.org/documentation/0.14.1/)时测量的占用内存。
-65f8aadad0ea0819f512eb33ecfc7e0a9b361735
+
 #### go
 5.8MB 
 
