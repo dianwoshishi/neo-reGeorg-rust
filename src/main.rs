@@ -24,6 +24,8 @@ const PORT: i32 = 7;
 // 自定义Base64编码表
 const EN: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const DE: &[u8] = b"dhULNVGsuAk/MxH6ibjcEfRqDWYznXBe9Pl7+SKoZ8pJaICgrQO0mF21yv345wtT";
+const BLV_OFFSET: i32 = 1966546385;
+const NEO_HELLO: &[u8] = b"6UNI/jhLR7X7fqPmY+m0BofOMNXNbVV2XNbiEVEODRxUbshHWKXC/mQWx0SNYVDFx1bKY0VDjcS3RcS/nGIOzVA0XOdI/cy=";
 
 // 全局会话存储
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
@@ -136,14 +138,6 @@ impl Session {
         })
     }
 
-    // // 同步写入方法（仅在必要时使用）
-    // fn write(&self, data: &[u8]) -> Result<(), io::Error> {
-    //     // 避免每次创建新的runtime，使用阻塞方式等待异步操作
-    //     tokio::task::block_in_place(|| {
-    //         tokio::runtime::Runtime::new()?.block_on(self.write_async(data))
-    //     })
-    // }
-
     fn close(&self) {
         *self.closed.lock().unwrap() = true;
     }
@@ -164,12 +158,11 @@ impl Session {
 fn build_maps() -> (HashMap<u8, u8>, HashMap<u8, u8>) {
     let mut en_map = HashMap::new();
     let mut de_map = HashMap::new();
-
+    
+    assert_eq!(EN.len(), DE.len());
+    
     for i in 0..EN.len() {
         en_map.insert(EN[i], DE[i]);
-    }
-
-    for i in 0..DE.len() {
         de_map.insert(DE[i], EN[i]);
     }
 
@@ -250,7 +243,7 @@ fn blv_encode(info: &HashMap<i32, Vec<u8>>) -> Vec<u8> {
     info.insert(39, rand_byte());
 
     for (&b, v) in &info {
-        let l = v.len() as i32 + 1966546385;
+        let l = v.len() as i32 + BLV_OFFSET;
         data.push(b as u8);
         data.extend_from_slice(&l.to_be_bytes());
         data.extend_from_slice(v);
@@ -258,30 +251,38 @@ fn blv_encode(info: &HashMap<i32, Vec<u8>>) -> Vec<u8> {
 
     data
 }
-fn print_hashmap(map: &HashMap<i32, Vec<u8>>) {
-    println!("HashMap 内容：");
-    for (key, value) in map {
-        // 尝试作为字符串打印
-        let value_str = String::from_utf8_lossy(value);
-        println!("键: {}, 值: {}", key, value_str);
-    }
-}
+// fn print_hashmap(map: &HashMap<i32, Vec<u8>>) {
+//     println!("HashMap 内容：");
+//     for (key, value) in map {
+//         // 尝试作为字符串打印
+//         let value_str = String::from_utf8_lossy(value);
+//         println!("键: {}, 值: {}", key, value_str);
+//     }
+// }
 // 处理HTTP请求
+
+fn write_reponse(request: tiny_http::Request, content: Vec<u8>) {
+    let response = tiny_http::Response::from_string(String::from_utf8_lossy(&content))
+            .with_status_code(200);
+    let _ = request.respond(response);
+}
+
 async fn handle_request(
     mut request: tiny_http::Request,
     en_map: &HashMap<u8, u8>,
     de_map: &HashMap<u8, u8>,
     sessions: Sessions,
 ) {
-    let neoreg_hello = b"6UNI/jhLR7X7fqPmY+m0BofOMNXNbVV2XNbiEVEODRxUbshHWKXC/mQWx0SNYVDFx1bKY0VDjcS3RcS/nGIOzVA0XOdI/cy=";
+    let neoreg_hello = NEO_HELLO;
     let decoded_hello = base64_decode(neoreg_hello, de_map).unwrap_or_default();
 
     // 读取请求体
     let mut data = Vec::new();
     if let Err(_) = request.as_reader().read_to_end(&mut data) {
-        let response = tiny_http::Response::from_string(String::from_utf8_lossy(&decoded_hello))
-            .with_status_code(200);
-        let _ = request.respond(response);
+        // let response = tiny_http::Response::from_string(String::from_utf8_lossy(&decoded_hello))
+        //     .with_status_code(200);
+        // let _ = request.respond(response);
+        write_reponse(request, decoded_hello.to_vec());
         return;
     }
 
@@ -289,10 +290,11 @@ async fn handle_request(
     let out = match base64_decode(&data, de_map) {
         Ok(out) if !out.is_empty() => out,
         _ => {
-            let response =
-                tiny_http::Response::from_string(String::from_utf8_lossy(&decoded_hello))
-                    .with_status_code(200);
-            let _ = request.respond(response);
+            // let response =
+            //     tiny_http::Response::from_string(String::from_utf8_lossy(&decoded_hello))
+            //         .with_status_code(200);
+            // let _ = request.respond(response);
+            write_reponse(request, decoded_hello.to_vec());
             return;
         }
     };
@@ -309,7 +311,7 @@ async fn handle_request(
         .get(&MARK)
         .map(|v| String::from_utf8_lossy(v).into_owned())
         .unwrap_or_default();
-    print_hashmap(&info);
+    // print_hashmap(&info);
     match cmd.as_str() {
         "CONNECT" => {
             let ip = info
@@ -387,18 +389,20 @@ async fn handle_request(
             rinfo.insert(STATUS, b"OK".to_vec());
         }
         _ => {
-            let response =
-                tiny_http::Response::from_string(String::from_utf8_lossy(&decoded_hello))
-                    .with_status_code(200);
-            let _ = request.respond(response);
+            // let response =
+            //     tiny_http::Response::from_string(String::from_utf8_lossy(&decoded_hello))
+            //         .with_status_code(200);
+            // let _ = request.respond(response);
+            write_reponse(request, decoded_hello.to_vec());
             return;
         }
     }
 
     let data = blv_encode(&rinfo);
     let encoded = base64_encode(&data, en_map);
-    let response = tiny_http::Response::from_data(encoded).with_status_code(200);
-    let _ = request.respond(response);
+    // let response = tiny_http::Response::from_data(encoded).with_status_code(200);
+    // let _ = request.respond(response);
+    write_reponse(request, encoded);
 }
 
 #[tokio::main]
@@ -412,7 +416,7 @@ async fn main() {
     let listen_addr = if args[1].contains(':') {
         args[1].clone()
     } else {
-        format!(":{}", args[1])
+        format!("0.0.0.0:{}", args[1])
     };
 
     let (en_map, de_map) = build_maps();
@@ -426,8 +430,16 @@ async fn main() {
         }
     };
 
-    println!("Server listening on http://{}", listen_addr);
-
+    // println!("Server listening on http://{}", listen_addr);
+    // When request with the HTTP heaser `Connection: close`, the request
+    // will close immediately. But when request with the HTTP heaser `Connection: keep-alive`,
+    // the request will keep connection for about 60s. So there are lots of read command sent
+    // during the connection.
+    // https://github.com/tiny-http/tiny-http
+    // When a client connection has sent its last request (by sending Connection: close header), 
+    // the thread will immediately stop reading from this client and can be reclaimed, even when 
+    // the request has not yet been answered. The reading part of the socket will also be 
+    // immediately closed.
     for request in server.incoming_requests() {
         let en_map = en_map.clone();
         let de_map = de_map.clone();
@@ -437,4 +449,3 @@ async fn main() {
 }
 
 
-// todo: there ia a connect 
