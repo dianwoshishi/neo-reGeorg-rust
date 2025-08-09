@@ -38,88 +38,103 @@ struct Session {
 }
 
 impl Session {
+    /// 创建一个新的会话实例
+    /// 
+    /// 会启动两个异步任务：一个用于从流中读取数据并存储到缓冲区，
+    /// 另一个用于从通道接收数据并写入到流中。
     fn new(stream: TcpStream) -> Self {
         // 克隆TcpStream，为两个异步任务提供独立实例
         let read_stream = stream.try_clone().expect("Failed to clone stream");
         let write_stream = stream.try_clone().expect("Failed to clone stream");
 
         // 明确指定通道传输类型为Vec<u8>
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(100);
         let buffer = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let closed = Arc::new(tokio::sync::Mutex::new(false));
 
-        // 读取线程（使用克隆的流）
-        let buffer_clone = Arc::clone(&buffer);
-        let closed_clone = Arc::clone(&closed);
-        tokio::spawn(async move {
-            // 使用tokio的异步IO trait，而非std的同步IO
-            use tokio::io::AsyncReadExt;
-            let mut stream = tokio::net::TcpStream::from_std(read_stream)
-                .expect("Failed to convert to async TcpStream");
-            let mut buf = [0; 513]; // 调整为512字节，更符合常见缓冲区大小
+        // 启动读写任务
+        Self::start_read_task(read_stream, Arc::clone(&buffer), Arc::clone(&closed));
+        Self::start_write_task(write_stream, rx, Arc::clone(&closed));
 
-            while !*closed_clone.lock().await {
+        Session { tx, buffer, closed }
+    }
+
+    /// 启动读取任务
+    /// 
+    /// 从TcpStream读取数据并存储到缓冲区中，直到连接关闭或发生错误。
+    fn start_read_task(
+        stream: TcpStream,
+        buffer: Arc<tokio::sync::Mutex<Vec<u8>>>,
+        closed: Arc<tokio::sync::Mutex<bool>>,
+    ) {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut stream = tokio::net::TcpStream::from_std(stream)
+                .expect("Failed to convert to async TcpStream");
+            let mut buf = [0; 513]; // 512字节缓冲区
+
+            while !*closed.lock().await {
                 match stream.read(&mut buf).await {
-                    // 使用异步read
                     Ok(n) => {
-                        // 1. 检查缓冲区大小，若超过限制则等待（不持有锁）
+                        // 检查缓冲区大小，若超过限制则等待
                         loop {
-                            let current_len = { buffer_clone.lock().await.len() };
-                            if current_len < 524288 {
-                                // 512KB上限
+                            let current_len = { buffer.lock().await.len() };
+                            if current_len < 524288 { // 512KB上限
                                 break;
                             }
                             time::sleep(Duration::from_millis(10)).await;
 
-                            // 再次检查关闭状态，避免无限等待
-                            if *closed_clone.lock().await {
+                            // 再次检查关闭状态
+                            if *closed.lock().await {
                                 return;
                             }
                         }
 
-                        // 2. 写入数据（无await，安全持有锁）
-                        let mut buffer = buffer_clone.lock().await;
-                        // println!("{:?}", buf.clone());
+                        // 写入数据到缓冲区
+                        let mut buffer = buffer.lock().await;
                         buffer.extend_from_slice(&buf[..n]);
                     }
                     Err(e) => {
-                        // 读取错误，标记为关闭
                         eprintln!("Read error: {}", e);
-                        *closed_clone.lock().await = true;
+                        *closed.lock().await = true;
                         break;
                     }
                 }
             }
-            // 尝试优雅关闭写入端
+            // 尝试优雅关闭
             let _ = stream.shutdown().await;
         });
+    }
 
-        // 写入线程（使用原始流）
-        let closed_clone = Arc::clone(&closed);
+    /// 启动写入任务
+    /// 
+    /// 从通道接收数据并写入到TcpStream中，直到通道关闭或发生错误。
+    fn start_write_task(
+        stream: TcpStream,
+        mut rx: mpsc::Receiver<Vec<u8>>,
+        closed: Arc<tokio::sync::Mutex<bool>>,
+    ) {
         tokio::spawn(async move {
-            // 使用tokio的异步IO trait
             use tokio::io::AsyncWriteExt;
-            let mut stream = tokio::net::TcpStream::from_std(write_stream)
+            let mut stream = tokio::net::TcpStream::from_std(stream)
                 .expect("Failed to convert to async TcpStream");
 
             while let Some(data) = rx.recv().await {
-                // 双重检查关闭状态，减少锁竞争
-                if *closed_clone.lock().await {
+                // 检查关闭状态
+                if *closed.lock().await {
                     break;
                 }
 
-                // 使用异步write_all
+                // 写入数据
                 if let Err(e) = stream.write_all(&data).await {
                     eprintln!("Write error: {}", e);
-                    *closed_clone.lock().await = true;
+                    *closed.lock().await = true;
                     break;
                 }
             }
-            // 尝试优雅关闭写入端
+            // 尝试优雅关闭
             let _ = stream.shutdown().await;
         });
-
-        Session { tx, buffer, closed }
     }
 
     // 异步写入方法（推荐使用）
