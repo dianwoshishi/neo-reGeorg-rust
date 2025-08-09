@@ -362,22 +362,129 @@ impl Session {
     }
 }
 
-// fn print_hashmap(map: &HashMap<i32, Vec<u8>>) {
-//     println!("HashMap 内容：");
-//     for (key, value) in map {
-//         // 尝试作为字符串打印
-//         let value_str = String::from_utf8_lossy(value);
-//         println!("键: {}, 值: {}", key, value_str);
-//     }
-// }
-// 处理HTTP请求
-
 fn write_reponse(request: tiny_http::Request, content: Vec<u8>) {
     let response =
         tiny_http::Response::from_string(String::from_utf8_lossy(&content)).with_status_code(200);
     let _ = request.respond(response);
 }
 
+// 辅助函数：设置失败响应
+fn set_failure_response(rinfo: &mut BlvMap, error_msg: impl Into<Vec<u8>>) {
+    rinfo.insert(STATUS, b"FAIL".to_vec());
+    rinfo.insert(ERROR, error_msg.into());
+}
+
+// 辅助函数：从info中获取字符串值
+fn get_info_string_from_key(info: &BlvMap, key: &i32) -> String {
+    info.get(key)
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .unwrap_or_default()
+}
+
+// 处理CONNECT命令
+async fn handle_connect(
+    info: &BlvMap,
+    mark: &str,
+    sessions: &Sessions,
+    rinfo: &mut BlvMap,
+) {
+    let ip = get_info_string_from_key(info, &IP);
+    let port_str = get_info_string_from_key(info, &PORT);
+    let target_addr = format!("{}:{}", ip, port_str);
+
+    match target_addr.parse::<SocketAddr>() {
+        Ok(addr) => match TcpStream::connect_timeout(&addr, Duration::from_millis(CONNECTION_TIMEOUT_MS)) {
+            Ok(conn) => {
+                sessions.lock().await.insert(mark.to_string(), Session::new(conn));
+                rinfo.insert(STATUS, b"OK".to_vec());
+            }
+            Err(e) => {
+                set_failure_response(rinfo, e.to_string().into_bytes());
+            }
+        },
+        Err(e) => {
+            set_failure_response(rinfo, format!("Invalid address: {}", e).into_bytes());
+        }
+    }
+}
+
+// 处理FORWARD命令
+async fn handle_forward(
+    info: &BlvMap,
+    mark: &str,
+    sessions: &Sessions,
+    rinfo: &mut BlvMap,
+) {
+    let mut sessions = sessions.lock().await;
+    if let Some(session) = sessions.get_mut(mark) {
+        if let Some(data) = info.get(&DATA) {
+            match session.write_async(data).await {
+                Ok(_) => {
+                    rinfo.insert(STATUS, b"OK".to_vec());
+                }
+                Err(e) => {
+                    set_failure_response(rinfo, e.to_string().into_bytes());
+                }
+            }
+        } else {
+            set_failure_response(rinfo, b"No data provided".to_vec());
+        }
+    } else {
+        set_failure_response(rinfo, b"Session not found".to_vec());
+    }
+}
+
+// 处理READ命令
+async fn handle_read(
+    mark: &str,
+    sessions: &Sessions,
+    rinfo: &mut BlvMap,
+) {
+    // 首先检查会话是否存在
+    let session_exists = { sessions.lock().await.contains_key(mark) };
+    
+    if session_exists {
+        // 获取会话的克隆引用
+        let session = { sessions.lock().await.get(mark).cloned() };
+        if let Some(session) = session {
+            if session.is_closed().await {
+                set_failure_response(rinfo, b"Session is closed".to_vec());
+            } else {
+                rinfo.insert(STATUS, b"OK".to_vec());
+                match session.read_async().await {
+                    Ok(data) if !data.is_empty() => {
+                        rinfo.insert(DATA, data);
+                    }
+                    Ok(_) => {
+                        // Data is empty, do nothing
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to read data: {:?}", e);
+                    }
+                }
+            }
+        } else {
+            set_failure_response(rinfo, b"Session not found".to_vec());
+        }
+    } else {
+        set_failure_response(rinfo, b"Session not found".to_vec());
+    }
+}
+
+// 处理DISCONNECT命令
+async fn handle_disconnect(
+    mark: &str,
+    sessions: &Sessions,
+    rinfo: &mut BlvMap,
+) {
+    let mut sessions = sessions.lock().await;
+    if let Some(session) = sessions.remove(mark) {
+        session.close().await;
+    }
+    rinfo.insert(STATUS, b"OK".to_vec());
+}
+
+// 主请求处理函数
 async fn handle_request(
     mut request: tiny_http::Request,
     codec: &Codec,
@@ -386,11 +493,13 @@ async fn handle_request(
     let neoreg_hello = NEO_HELLO;
     let decoded_hello = codec.base64_decode(neoreg_hello).unwrap_or_default();
 
+    // 读取请求数据
     let mut data = Vec::new();
     if let Err(_) = request.as_reader().read_to_end(&mut data) {
         write_reponse(request, decoded_hello.to_vec());
         return Ok(());
     }
+
     // 解码数据
     let out = match codec.base64_decode(&data) {
         Ok(out) if !out.is_empty() => out,
@@ -400,115 +509,29 @@ async fn handle_request(
         }
     };
 
+    // 解析BLV格式数据
     let info = codec.blv_decode(&out);
 
+    // 准备响应数据
     let mut rinfo = HashMap::new();
 
-    // 辅助函数：设置失败响应
-    fn set_failure_response(rinfo: &mut BlvMap, error_msg: impl Into<Vec<u8>>) {
-        rinfo.insert(STATUS, b"FAIL".to_vec());
-        rinfo.insert(ERROR, error_msg.into());
-    }
+    // 提取命令和标记
+    let cmd = get_info_string_from_key(&info, &CMD);
+    let mark = get_info_string_from_key(&info, &MARK);
 
-    let cmd = info
-        .get(&CMD)
-        .map(|v| String::from_utf8_lossy(v).into_owned())
-        .unwrap_or_default();
-    let mark = info
-        .get(&MARK)
-        .map(|v| String::from_utf8_lossy(v).into_owned())
-        .unwrap_or_default();
-    // print_hashmap(&info);
+    // 根据命令类型分发处理
     match cmd.as_str() {
-        "CONNECT" => {
-            let ip = info
-                .get(&IP)
-                .map(|v| String::from_utf8_lossy(v))
-                .unwrap_or_default();
-            let port_str = info
-                .get(&PORT)
-                .map(|v| String::from_utf8_lossy(v))
-                .unwrap_or_default();
-            let target_addr = format!("{}:{}", ip, port_str);
-
-            match target_addr.parse::<SocketAddr>() {
-                Ok(addr) => match TcpStream::connect_timeout(&addr, Duration::from_millis(CONNECTION_TIMEOUT_MS)) {
-                    Ok(conn) => {
-                        sessions.lock().await.insert(mark, Session::new(conn));
-                        rinfo.insert(STATUS, b"OK".to_vec());
-                    }
-                    Err(e) => {
-                        set_failure_response(&mut rinfo, e.to_string().into_bytes());
-                    }
-                },
-                Err(e) => {
-                    set_failure_response(&mut rinfo, format!("Invalid address: {}", e).into_bytes());
-                }
-            }
-        }
-        "FORWARD" => {
-            let mut sessions = sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&mark) {
-                if let Some(data) = info.get(&DATA) {
-                    match session.write_async(data).await {
-                        Ok(_) => {
-                            rinfo.insert(STATUS, b"OK".to_vec());
-                        }
-                        Err(e) => {
-                            set_failure_response(&mut rinfo, e.to_string().into_bytes());
-                        }
-                    }
-                } else {
-                        set_failure_response(&mut rinfo, b"No data provided".to_vec());
-                    }
-            } else {
-                set_failure_response(&mut rinfo, b"Session not found".to_vec());
-            }
-        }
-        "READ" => {
-            // 首先检查会话是否存在
-            let session_exists = { sessions.lock().await.contains_key(&mark) };
-            
-            if session_exists {
-                // 获取会话的克隆引用
-                let session = { sessions.lock().await.get(&mark).cloned() };
-                if let Some(session) = session {
-                    if session.is_closed().await {
-                        set_failure_response(&mut rinfo, b"Session is closed".to_vec());
-                    } else {
-                        rinfo.insert(STATUS, b"OK".to_vec());
-                        match session.read_async().await {
-                            Ok(data) if !data.is_empty() => {
-                                rinfo.insert(DATA, data);
-                            }
-                            Ok(_) => {
-                                // Data is empty, do nothing
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to read data: {:?}", e);
-                            }
-                        }
-                    }
-                } else {
-                    set_failure_response(&mut rinfo, b"Session not found".to_vec());
-                }
-            } else {
-                set_failure_response(&mut rinfo, b"Session not found".to_vec());
-            }
-        }
-        "DISCONNECT" => {
-            let mut sessions = sessions.lock().await;
-            if let Some(session) = sessions.remove(&mark) {
-                session.close().await;
-            }
-            rinfo.insert(STATUS, b"OK".to_vec());
-        }
+        "CONNECT" => handle_connect(&info, &mark, &sessions, &mut rinfo).await,
+        "FORWARD" => handle_forward(&info, &mark, &sessions, &mut rinfo).await,
+        "READ" => handle_read(&mark, &sessions, &mut rinfo).await,
+        "DISCONNECT" => handle_disconnect(&mark, &sessions, &mut rinfo).await,
         _ => {
             write_reponse(request, decoded_hello.to_vec());
             return Ok(());
         }
     }
 
+    // 构建并发送响应
     let data = codec.blv_encode(&rinfo);
     let encoded = codec.base64_encode(&data);
     write_reponse(request, encoded);
