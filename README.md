@@ -68,12 +68,12 @@ panic = "abort"
 ![img.png](images/img-go.png)
 
 #### rust编译产物(740KB)
-740 KB (758,262 字节)
+420 KB (434,176 字节)
 
 ![img.png](images/img-rust.png)
 
 #### 对比结果
-$$\frac{go}{rust}= \frac{5,742,080}{758,262} \approx 7.572$$
+$$\frac{go}{rust}= \frac{5,742,080}{434,176} \approx 13.225$$
 
 ### 运行内存对比
 因为内存有些是运行时分配的，因此不能仅仅简单对照程序启动时的内存。
@@ -140,7 +140,7 @@ uv run .\neoreg.py -k password -u http://target-ip:8080 -vvv -l 0.0.0.0 -p 1080
 
 
 ## 总结
-总体来说，go版本的落地文件是rust的7.5倍；从运行内存来说，go版本是rust版本的3.4倍。基本可以满足一些go版本满足不了的嵌入式环境。
+总体来说，go版本的落地文件是rust的13.225倍；从运行内存来说，go版本是rust版本的3.4倍。基本可以满足一些go版本满足不了的嵌入式环境。
 
 另外，从go的 [tunnel.go](https://github.com/L-codes/Neo-reGeorg/blob/master/templates/tunnel.go) 到[src/main.rs](src/main.rs) 的迁移我是用AI转换，转换过程也很快。这得益于rust强类型和rustc编译器的拷打。运行无bug。
 > 最近发现字节的Trae对于rust的支持很好，自动化AI编程的感觉更进一步。有一种感觉，rust虽然语法复杂，但是对于AI来说，这些强类型和约束，正好是喂给AI的确定性，使得AI能够更好的与rust交互，减轻人类用户的心智负担。
