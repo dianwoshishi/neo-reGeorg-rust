@@ -19,3 +19,4 @@ codegen-units = 1
 # 去除调试信息（默认 release 已有一定程度去除，显式关闭更彻底）
 debug = false
 panic = "abort"
+strip = "debuginfo"
