@@ -8,7 +8,6 @@ use std::time::Duration;
 use tiny_http::Server;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time;
 
 // 常量定义
 const DATA: i32 = 1;
@@ -28,13 +27,13 @@ const BLV_OFFSET: i32 = 1966546385;
 const NEO_HELLO: &[u8] = b"6UNI/jhLR7X7fqPmY+m0BofOMNXNbVV2XNbiEVEODRxUbshHWKXC/mQWx0SNYVDFx1bKY0VDjcS3RcS/nGIOzVA0XOdI/cy=";
 
 // 全局会话存储 - 使用tokio的Mutex确保异步环境下的线程安全
-type Sessions = Arc<tokio::sync::Mutex<HashMap<String, Session>>>;
+type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 
 // 会话结构体
 struct Session {
     tx: mpsc::Sender<Vec<u8>>,
-    buffer: Arc<tokio::sync::Mutex<Vec<u8>>>,
-    closed: Arc<tokio::sync::Mutex<bool>>,
+    rx_buffer: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    closed: Arc<Mutex<bool>>,
 }
 
 impl Session {
@@ -48,24 +47,25 @@ impl Session {
         let write_stream = stream.try_clone().expect("Failed to clone stream");
 
         // 明确指定通道传输类型为Vec<u8>
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(100);
-        let buffer = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let closed = Arc::new(tokio::sync::Mutex::new(false));
+        let (tx_write, rx_write) = mpsc::channel::<Vec<u8>>(100);
+        let (tx_buffer, rx_buffer) = mpsc::channel::<Vec<u8>>(100);
+        let closed = Arc::new(Mutex::new(false));
+        let rx_buffer = Arc::new(Mutex::new(rx_buffer));
 
         // 启动读写任务
-        Self::start_read_task(read_stream, Arc::clone(&buffer), Arc::clone(&closed));
-        Self::start_write_task(write_stream, rx, Arc::clone(&closed));
+        Self::start_read_task(read_stream, tx_buffer, Arc::clone(&closed));
+        Self::start_write_task(write_stream, rx_write, Arc::clone(&closed));
 
-        Session { tx, buffer, closed }
+        Session { tx: tx_write, rx_buffer, closed }
     }
 
     /// 启动读取任务
     /// 
-    /// 从TcpStream读取数据并存储到缓冲区中，直到连接关闭或发生错误。
+    /// 从TcpStream读取数据并通过通道发送，直到连接关闭或发生错误。
     fn start_read_task(
         stream: TcpStream,
-        buffer: Arc<tokio::sync::Mutex<Vec<u8>>>,
-        closed: Arc<tokio::sync::Mutex<bool>>,
+        tx_buffer: mpsc::Sender<Vec<u8>>,
+        closed: Arc<Mutex<bool>>,
     ) {
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
@@ -76,23 +76,18 @@ impl Session {
             while !*closed.lock().await {
                 match stream.read(&mut buf).await {
                     Ok(n) => {
-                        // 检查缓冲区大小，若超过限制则等待
-                        loop {
-                            let current_len = { buffer.lock().await.len() };
-                            if current_len < 524288 { // 512KB上限
-                                break;
-                            }
-                            time::sleep(Duration::from_millis(10)).await;
-
-                            // 再次检查关闭状态
-                            if *closed.lock().await {
-                                return;
-                            }
+                        if n == 0 {
+                            // 连接关闭
+                            *closed.lock().await = true;
+                            break;
                         }
-
-                        // 写入数据到缓冲区
-                        let mut buffer = buffer.lock().await;
-                        buffer.extend_from_slice(&buf[..n]);
+                        // 发送数据到通道
+                        let data = buf[..n].to_vec();
+                        if let Err(e) = tx_buffer.send(data).await {
+                            eprintln!("Send to buffer channel error: {}", e);
+                            *closed.lock().await = true;
+                            break;
+                        }
                     }
                     Err(e) => {
                         eprintln!("Read error: {}", e);
@@ -112,7 +107,7 @@ impl Session {
     fn start_write_task(
         stream: TcpStream,
         mut rx: mpsc::Receiver<Vec<u8>>,
-        closed: Arc<tokio::sync::Mutex<bool>>,
+        closed: Arc<Mutex<bool>>,
     ) {
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -160,11 +155,30 @@ impl Session {
     }
 
     // 异步读取缓冲区数据
-    async fn read_buffer(&self) -> Vec<u8> {
-        let mut buffer = self.buffer.lock().await;
-        let data = buffer.clone();
-        buffer.clear();
-        data
+    async fn read_async(&self) -> Vec<u8> {
+        use tokio::time::{timeout, Duration};
+        let mut all_data = Vec::new();
+        let closed = self.is_closed().await;
+
+        // 尝试从通道接收所有可用数据
+        {{
+            let mut rx = self.rx_buffer.lock().await;
+            while let Ok(data) = rx.try_recv() {
+                all_data.extend(data);
+            }
+        }}
+
+        // 如果没有数据且连接未关闭，尝试异步接收一个数据块
+        if all_data.is_empty() && !closed {
+            let mut rx = self.rx_buffer.lock().await;
+            if let Ok(data) = timeout(Duration::from_millis(100), rx.recv()).await {
+                if let Some(data) = data {
+                    all_data.extend(data);
+                }
+            }
+        }
+
+        all_data
     }
 
     async fn is_closed(&self) -> bool {
@@ -389,7 +403,7 @@ async fn handle_request(
                       rinfo.insert(ERROR, b"Session is closed".to_vec());
                   } else {
                       rinfo.insert(STATUS, b"OK".to_vec());
-                      let data = session.read_buffer().await;
+                      let data = session.read_async().await;
                       if !data.is_empty() {
                           rinfo.insert(DATA, data);
                       }
