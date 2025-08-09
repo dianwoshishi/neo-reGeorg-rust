@@ -1,0 +1,55 @@
+flowchart TD
+    subgraph 服务器初始化
+        A[解析命令行参数] --> B[创建Codec实例]
+        B --> C[初始化sessions哈希表]
+        C --> D[启动TCP服务器]
+    end
+
+    subgraph 请求处理
+        D --> E[接收客户端请求]
+        E --> F[读取请求数据]
+        F --> G[Base64解码]
+        G --> H[BLV解码为BlvMap]
+        H --> I[提取命令和会话标识]
+    end
+
+    subgraph 命令处理
+        I --> J{命令类型}
+        J -->|CONNECT| K[提取目标IP和端口]
+        K --> L[连接目标服务器]
+        L -->|成功| M[创建新Session]
+        M --> N[存储Session到哈希表]
+        
+        J -->|FORWARD| P[查找Session]
+        P -->|找到| Q[发送数据到目标服务器]
+        Q --> R[返回操作状态]
+        
+        J -->|READ| T[检查Session是否存在]
+        T -->|存在| U[读取数据]
+        U --> V[返回数据]
+        
+        J -->|DISCONNECT| X[查找并移除Session]
+        X --> Y[关闭Session连接]
+        Y --> Z[返回操作状态]
+    end
+
+    subgraph Session管理
+        M --> AA[启动读任务]
+        AA --> AB[从TcpStream读取数据]
+        AB --> AC[发送到缓冲区通道]
+        
+        M --> AD[启动写任务]
+        AD --> AE[从写入通道接收数据]
+        AE --> AF[写入到TcpStream]
+    end
+
+    subgraph 响应处理
+        N --> AG[构建响应信息]
+        R --> AG
+        V --> AG
+        Z --> AG
+        
+        AG --> AH[BLV编码]
+        AH --> AI[Base64编码]
+        AI --> AJ[发送响应给客户端]
+    end
