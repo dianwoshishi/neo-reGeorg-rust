@@ -3,11 +3,11 @@ use rand::{Rng, TryRngCore};
 use std::collections::HashMap;
 use std::io::{self};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc,Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tiny_http::Server;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time;
 
 // 常量定义
@@ -27,14 +27,14 @@ const DE: &[u8] = b"dhULNVGsuAk/MxH6ibjcEfRqDWYznXBe9Pl7+SKoZ8pJaICgrQO0mF21yv34
 const BLV_OFFSET: i32 = 1966546385;
 const NEO_HELLO: &[u8] = b"6UNI/jhLR7X7fqPmY+m0BofOMNXNbVV2XNbiEVEODRxUbshHWKXC/mQWx0SNYVDFx1bKY0VDjcS3RcS/nGIOzVA0XOdI/cy=";
 
-// 全局会话存储
-type Sessions = Arc<Mutex<HashMap<String, Session>>>;
+// 全局会话存储 - 使用tokio的Mutex确保异步环境下的线程安全
+type Sessions = Arc<tokio::sync::Mutex<HashMap<String, Session>>>;
 
 // 会话结构体
 struct Session {
     tx: mpsc::Sender<Vec<u8>>,
-    buffer: Arc<Mutex<Vec<u8>>>,
-    closed: Arc<Mutex<bool>>,
+    buffer: Arc<tokio::sync::Mutex<Vec<u8>>>,
+    closed: Arc<tokio::sync::Mutex<bool>>,
 }
 
 impl Session {
@@ -45,8 +45,8 @@ impl Session {
 
         // 明确指定通道传输类型为Vec<u8>
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let closed = Arc::new(Mutex::new(false));
+        let buffer = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let closed = Arc::new(tokio::sync::Mutex::new(false));
 
         // 读取线程（使用克隆的流）
         let buffer_clone = Arc::clone(&buffer);
@@ -58,13 +58,13 @@ impl Session {
                 .expect("Failed to convert to async TcpStream");
             let mut buf = [0; 513]; // 调整为512字节，更符合常见缓冲区大小
 
-            while !*closed_clone.lock().unwrap() {
+            while !*closed_clone.lock().await {
                 match stream.read(&mut buf).await {
                     // 使用异步read
                     Ok(n) => {
                         // 1. 检查缓冲区大小，若超过限制则等待（不持有锁）
                         loop {
-                            let current_len = { buffer_clone.lock().unwrap().len() };
+                            let current_len = { buffer_clone.lock().await.len() };
                             if current_len < 524288 {
                                 // 512KB上限
                                 break;
@@ -72,20 +72,20 @@ impl Session {
                             time::sleep(Duration::from_millis(10)).await;
 
                             // 再次检查关闭状态，避免无限等待
-                            if *closed_clone.lock().unwrap() {
+                            if *closed_clone.lock().await {
                                 return;
                             }
                         }
 
                         // 2. 写入数据（无await，安全持有锁）
-                        let mut buffer = buffer_clone.lock().unwrap();
+                        let mut buffer = buffer_clone.lock().await;
                         // println!("{:?}", buf.clone());
                         buffer.extend_from_slice(&buf[..n]);
                     }
                     Err(e) => {
                         // 读取错误，标记为关闭
                         eprintln!("Read error: {}", e);
-                        *closed_clone.lock().unwrap() = true;
+                        *closed_clone.lock().await = true;
                         break;
                     }
                 }
@@ -104,14 +104,14 @@ impl Session {
 
             while let Some(data) = rx.recv().await {
                 // 双重检查关闭状态，减少锁竞争
-                if *closed_clone.lock().unwrap() {
+                if *closed_clone.lock().await {
                     break;
                 }
 
                 // 使用异步write_all
                 if let Err(e) = stream.write_all(&data).await {
                     eprintln!("Write error: {}", e);
-                    *closed_clone.lock().unwrap() = true;
+                    *closed_clone.lock().await = true;
                     break;
                 }
             }
@@ -119,12 +119,12 @@ impl Session {
             let _ = stream.shutdown().await;
         });
 
-        Session { tx, buffer, closed}
+        Session { tx, buffer, closed }
     }
 
     // 异步写入方法（推荐使用）
     async fn write_async(&self, data: &[u8]) -> Result<(), io::Error> {
-        let closed = *self.closed.lock().unwrap();
+        let closed = *self.closed.lock().await;
         if closed {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -132,25 +132,28 @@ impl Session {
             ));
         }
 
-        self.tx.send(data.to_vec()).await.map_err(|_| {
-            *self.closed.lock().unwrap() = true;
-            io::Error::new(io::ErrorKind::BrokenPipe, "send failed")
-        })
+        let result = self.tx.send(data.to_vec()).await;
+        if result.is_err() {
+            *self.closed.lock().await = true;
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "send failed"));
+        }
+        Ok(())
     }
 
-    fn close(&self) {
-        *self.closed.lock().unwrap() = true;
+    async fn close(&self) {
+        *self.closed.lock().await = true;
     }
 
-    fn read_buffer(&self) -> Vec<u8> {
-        let mut buffer = self.buffer.lock().unwrap();
+    // 异步读取缓冲区数据
+    async fn read_buffer(&self) -> Vec<u8> {
+        let mut buffer = self.buffer.lock().await;
         let data = buffer.clone();
         buffer.clear();
         data
     }
 
-    fn is_closed(&self) -> bool {
-        *self.closed.lock().unwrap()
+    async fn is_closed(&self) -> bool {
+        *self.closed.lock().await
     }
 }
 
@@ -158,9 +161,9 @@ impl Session {
 fn build_maps() -> (HashMap<u8, u8>, HashMap<u8, u8>) {
     let mut en_map = HashMap::new();
     let mut de_map = HashMap::new();
-    
+
     assert_eq!(EN.len(), DE.len());
-    
+
     for i in 0..EN.len() {
         en_map.insert(EN[i], DE[i]);
         de_map.insert(DE[i], EN[i]);
@@ -262,8 +265,8 @@ fn blv_encode(info: &HashMap<i32, Vec<u8>>) -> Vec<u8> {
 // 处理HTTP请求
 
 fn write_reponse(request: tiny_http::Request, content: Vec<u8>) {
-    let response = tiny_http::Response::from_string(String::from_utf8_lossy(&content))
-            .with_status_code(200);
+    let response =
+        tiny_http::Response::from_string(String::from_utf8_lossy(&content)).with_status_code(200);
     let _ = request.respond(response);
 }
 
@@ -327,7 +330,7 @@ async fn handle_request(
             match target_addr.parse::<SocketAddr>() {
                 Ok(addr) => match TcpStream::connect_timeout(&addr, Duration::from_millis(3000)) {
                     Ok(conn) => {
-                        sessions.lock().unwrap().insert(mark, Session::new(conn));
+                        sessions.lock().await.insert(mark, Session::new(conn));
                         rinfo.insert(STATUS, b"OK".to_vec());
                     }
                     Err(e) => {
@@ -342,7 +345,7 @@ async fn handle_request(
             }
         }
         "FORWARD" => {
-            let mut sessions = sessions.lock().unwrap();
+            let mut sessions = sessions.lock().await;
             if let Some(session) = sessions.get_mut(&mark) {
                 if let Some(data) = info.get(&DATA) {
                     match session.write_async(data).await {
@@ -364,27 +367,27 @@ async fn handle_request(
             }
         }
         "READ" => {
-            let sessions = sessions.lock().unwrap();
+            let sessions = sessions.lock().await;
             if let Some(session) = sessions.get(&mark) {
-                if session.is_closed() {
-                    rinfo.insert(STATUS, b"FAIL".to_vec());
-                    rinfo.insert(ERROR, b"Session is closed".to_vec());
-                } else {
-                    rinfo.insert(STATUS, b"OK".to_vec());
-                    let data = session.read_buffer();
-                    if !data.is_empty() {
-                        rinfo.insert(DATA, data);
-                    }
-                }
+                if session.is_closed().await {
+                      rinfo.insert(STATUS, b"FAIL".to_vec());
+                      rinfo.insert(ERROR, b"Session is closed".to_vec());
+                  } else {
+                      rinfo.insert(STATUS, b"OK".to_vec());
+                      let data = session.read_buffer().await;
+                      if !data.is_empty() {
+                          rinfo.insert(DATA, data);
+                      }
+                  }
             } else {
                 rinfo.insert(STATUS, b"FAIL".to_vec());
                 rinfo.insert(ERROR, b"Session not found".to_vec());
             }
         }
         "DISCONNECT" => {
-            let mut sessions = sessions.lock().unwrap();
+            let mut sessions = sessions.lock().await;
             if let Some(session) = sessions.remove(&mark) {
-                session.close();
+                session.close().await;
             }
             rinfo.insert(STATUS, b"OK".to_vec());
         }
@@ -419,7 +422,9 @@ async fn main() {
         format!("0.0.0.0:{}", args[1])
     };
 
-    let (en_map, de_map) = build_maps();
+    // 使用Arc共享不可变的映射表
+    let en_map = Arc::new(build_maps().0);
+    let de_map = Arc::new(build_maps().1);
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
 
     let server = match Server::http(&listen_addr) {
@@ -436,16 +441,18 @@ async fn main() {
     // the request will keep connection for about 60s. So there are lots of read command sent
     // during the connection.
     // https://github.com/tiny-http/tiny-http
-    // When a client connection has sent its last request (by sending Connection: close header), 
-    // the thread will immediately stop reading from this client and can be reclaimed, even when 
-    // the request has not yet been answered. The reading part of the socket will also be 
+    // When a client connection has sent its last request (by sending Connection: close header),
+    // the thread will immediately stop reading from this client and can be reclaimed, even when
+    // the request has not yet been answered. The reading part of the socket will also be
     // immediately closed.
     for request in server.incoming_requests() {
-        let en_map = en_map.clone();
-        let de_map = de_map.clone();
-        let sessions = sessions.clone();
-        handle_request(request, &en_map, &de_map, sessions).await;
+        // 只克隆必要的Arc指针
+        let en_map_clone = Arc::clone(&en_map);
+        let de_map_clone = Arc::clone(&de_map);
+        let sessions_clone = Arc::clone(&sessions);
+        // 使用tokio::spawn并行处理每个请求
+        tokio::spawn(async move {
+            handle_request(request, &en_map_clone, &de_map_clone, sessions_clone).await;
+        });
     }
 }
-
-
