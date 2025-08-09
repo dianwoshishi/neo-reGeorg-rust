@@ -283,6 +283,11 @@ fn blv_encode(info: &HashMap<i32, Vec<u8>>) -> Vec<u8> {
 
     data
 }
+
+// 测试模块
+#[cfg(test)]
+mod test;
+
 // fn print_hashmap(map: &HashMap<i32, Vec<u8>>) {
 //     println!("HashMap 内容：");
 //     for (key, value) in map {
