@@ -20,8 +20,8 @@ const STATUS: i32 = 4;
 const ERROR: i32 = 5;
 const IP: i32 = 6;
 const PORT: i32 = 7;
-const CHANNEL_CAPACITY: usize = 100;
-const BUFFER_SIZE: usize = 513;
+const CHANNEL_CAPACITY: usize = 1024;
+const BUFFER_SIZE: usize = 1024;
 const TIMEOUT_MS: u64 = 10;
 const CONNECTION_TIMEOUT_MS: u64 = 3000;
 
@@ -209,10 +209,10 @@ impl Session {
     fn new(stream: TcpStream) -> Self {
         // 克隆TcpStream，为两个异步任务提供独立实例
         let read_stream = stream.try_clone()
-            .map_err(|e| NeoError::Io(io::Error::new(io::ErrorKind::Other, e)))
+            .map_err(|e| NeoError::Io(e))
             .expect("Failed to clone stream");
         let write_stream = stream.try_clone()
-            .map_err(|e| NeoError::Io(io::Error::new(io::ErrorKind::Other, e)))
+            .map_err(|e| NeoError::Io(e))
             .expect("Failed to clone stream");
 
         // 明确指定通道传输类型为Vec<u8>
@@ -238,7 +238,7 @@ impl Session {
     ) {
         tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::from_std(stream)
-                .map_err(|e| NeoError::Io(io::Error::new(io::ErrorKind::Other, e)))
+                .map_err(|e| NeoError::Io(e))
                 .expect("Failed to convert to async TcpStream");
             let mut buf = [0; BUFFER_SIZE];
 
@@ -282,7 +282,7 @@ impl Session {
     ) {
         tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::from_std(stream)
-                .map_err(|e| NeoError::Io(io::Error::new(io::ErrorKind::Other, e)))
+                .map_err(|e| NeoError::Io(e))
                 .expect("Failed to convert to async TcpStream");
 
             while let Some(data) = rx.recv().await {
@@ -404,6 +404,12 @@ async fn handle_request(
 
     let mut rinfo = HashMap::new();
 
+    // 辅助函数：设置失败响应
+    fn set_failure_response(rinfo: &mut BlvMap, error_msg: impl Into<Vec<u8>>) {
+        rinfo.insert(STATUS, b"FAIL".to_vec());
+        rinfo.insert(ERROR, error_msg.into());
+    }
+
     let cmd = info
         .get(&CMD)
         .map(|v| String::from_utf8_lossy(v).into_owned())
@@ -432,13 +438,11 @@ async fn handle_request(
                         rinfo.insert(STATUS, b"OK".to_vec());
                     }
                     Err(e) => {
-                        rinfo.insert(STATUS, b"FAIL".to_vec());
-                        rinfo.insert(ERROR, e.to_string().into_bytes());
+                        set_failure_response(&mut rinfo, e.to_string().into_bytes());
                     }
                 },
                 Err(e) => {
-                    rinfo.insert(STATUS, b"FAIL".to_vec());
-                    rinfo.insert(ERROR, format!("Invalid address: {}", e).into_bytes());
+                    set_failure_response(&mut rinfo, format!("Invalid address: {}", e).into_bytes());
                 }
             }
         }
@@ -451,17 +455,14 @@ async fn handle_request(
                             rinfo.insert(STATUS, b"OK".to_vec());
                         }
                         Err(e) => {
-                            rinfo.insert(STATUS, b"FAIL".to_vec());
-                            rinfo.insert(ERROR, e.to_string().into_bytes());
+                            set_failure_response(&mut rinfo, e.to_string().into_bytes());
                         }
                     }
                 } else {
-                    rinfo.insert(STATUS, b"FAIL".to_vec());
-                    rinfo.insert(ERROR, b"No data provided".to_vec());
-                }
+                        set_failure_response(&mut rinfo, b"No data provided".to_vec());
+                    }
             } else {
-                rinfo.insert(STATUS, b"FAIL".to_vec());
-                rinfo.insert(ERROR, b"Session not found".to_vec());
+                set_failure_response(&mut rinfo, b"Session not found".to_vec());
             }
         }
         "READ" => {
@@ -473,8 +474,7 @@ async fn handle_request(
                 let session = { sessions.lock().await.get(&mark).cloned() };
                 if let Some(session) = session {
                     if session.is_closed().await {
-                        rinfo.insert(STATUS, b"FAIL".to_vec());
-                        rinfo.insert(ERROR, b"Session is closed".to_vec());
+                        set_failure_response(&mut rinfo, b"Session is closed".to_vec());
                     } else {
                         rinfo.insert(STATUS, b"OK".to_vec());
                         match session.read_async().await {
@@ -490,12 +490,10 @@ async fn handle_request(
                         }
                     }
                 } else {
-                    rinfo.insert(STATUS, b"FAIL".to_vec());
-                    rinfo.insert(ERROR, b"Session not found".to_vec());
+                    set_failure_response(&mut rinfo, b"Session not found".to_vec());
                 }
             } else {
-                rinfo.insert(STATUS, b"FAIL".to_vec());
-                rinfo.insert(ERROR, b"Session not found".to_vec());
+                set_failure_response(&mut rinfo, b"Session not found".to_vec());
             }
         }
         "DISCONNECT" => {
@@ -506,10 +504,6 @@ async fn handle_request(
             rinfo.insert(STATUS, b"OK".to_vec());
         }
         _ => {
-            // let response =
-            //     tiny_http::Response::from_string(String::from_utf8_lossy(&decoded_hello))
-            //         .with_status_code(200);
-            // let _ = request.respond(response);
             write_reponse(request, decoded_hello.to_vec());
             return Ok(());
         }
@@ -517,8 +511,6 @@ async fn handle_request(
 
     let data = codec.blv_encode(&rinfo);
     let encoded = codec.base64_encode(&data);
-    // let response = tiny_http::Response::from_data(encoded).with_status_code(200);
-    // let _ = request.respond(response);
     write_reponse(request, encoded);
     Ok(())
 }
