@@ -61,6 +61,29 @@ const DE: &[u8] = b"dhULNVGsuAk/MxH6ibjcEfRqDWYznXBe9Pl7+SKoZ8pJaICgrQO0mF21yv34
 const BLV_OFFSET: i32 = 1966546385;
 const NEO_HELLO: &[u8] = b"6UNI/jhLR7X7fqPmY+m0BofOMNXNbVV2XNbiEVEODRxUbshHWKXC/mQWx0SNYVDFx1bKY0VDjcS3RcS/nGIOzVA0XOdI/cy=";
 
+/// 从数据中读取并解码长度字段
+/// 长度字段为4字节大端序整数，需要减去BLV_OFFSET
+fn read_and_decode_length(data: &[u8], cursor: &mut usize) -> Result<usize, NeoError> {
+    if *cursor + 4 > data.len() {
+        return Err(NeoError::Other("Insufficient data for length decoding".to_string()));
+    }
+    
+    let l_bytes = [
+        data[*cursor],
+        data[*cursor + 1],
+        data[*cursor + 2],
+        data[*cursor + 3],
+    ];
+    let l = i32::from_be_bytes(l_bytes) - BLV_OFFSET;
+    *cursor += 4;
+    
+    if l < 0 {
+        return Err(NeoError::Other("Decoded length is negative".to_string()));
+    }
+    
+    Ok(l as usize)
+}
+
 // 自定义错误类型
 #[derive(Debug)]
 enum NeoError {
@@ -171,19 +194,11 @@ impl Codec {
             let b = data[cursor] as i32;
             cursor += 1;
 
-            if cursor + 4 > data.len() {
-                break;
-            }
-            let l_bytes = [
-                data[cursor],
-                data[cursor + 1],
-                data[cursor + 2],
-                data[cursor + 3],
-            ];
-            let l = i32::from_be_bytes(l_bytes) - BLV_OFFSET;
-            cursor += 4;
-
-            let l = l as usize;
+            // 使用函数封装读取和解码逻辑
+            let l = match read_and_decode_length(&data, &mut cursor) {
+                Ok(len) => len,
+                Err(_) => break,
+            };
             if cursor + l > data.len() {
                 break;
             }
@@ -483,11 +498,8 @@ async fn handle_read(
             } else {
                 rinfo.insert(MessageField::Status.into(), b"OK".to_vec());
                 match session.read_async().await {
-                    Ok(data) if !data.is_empty() => {
+                    Ok(data) => {
                         rinfo.insert(MessageField::Data.into(), data);
-                    }
-                    Ok(_) => {
-                        // Data is empty, do nothing
                     }
                     Err(e) => {
                         eprintln!("Failed to read data: {:?}", e);
@@ -524,17 +536,19 @@ async fn handle_request(
     let neoreg_hello = NEO_HELLO;
     let decoded_hello = codec.base64_decode(neoreg_hello).unwrap_or_default();
 
-    let mut data = Vec::new();
-    if let Err(_) = request.as_reader().read_to_end(&mut data) {
-        write_reponse(request, decoded_hello.to_vec());
-        return Ok(());
-    }
-    // 解码数据
-    let out = match codec.base64_decode(&data) {
-        Ok(out) if !out.is_empty() => out,
-        _ => {
+    // 读取并解码数据
+    let out = {
+        let mut data = Vec::new();
+        if request.as_reader().read_to_end(&mut data).is_err() || data.is_empty() {
             write_reponse(request, decoded_hello.to_vec());
             return Ok(());
+        }
+        match codec.base64_decode(&data) {
+            Ok(out) if !out.is_empty() => out,
+            _ => {
+                write_reponse(request, decoded_hello.to_vec());
+                return Ok(());
+            }
         }
     };
 
