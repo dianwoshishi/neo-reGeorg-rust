@@ -12,14 +12,44 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 
-// 常量定义
-const DATA: i32 = 1;
-const CMD: i32 = 2;
-const MARK: i32 = 3;
-const STATUS: i32 = 4;
-const ERROR: i32 = 5;
-const IP: i32 = 6;
-const PORT: i32 = 7;
+// 枚举定义
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MessageField {
+    Data = 1,
+    Cmd = 2,
+    Mark = 3,
+    Status = 4,
+    Error = 5,
+    Ip = 6,
+    Port = 7,
+    Random1 = 0,  // 用于blv_encode中的额外字段
+    Random2 = 39, // 用于blv_encode中的额外字段
+}
+
+impl From<MessageField> for i32 {
+    fn from(field: MessageField) -> Self {
+        field as i32
+    }
+}
+
+impl TryFrom<i32> for MessageField {
+    type Error = NeoError;
+
+    fn try_from(value: i32) -> Result<Self, NeoError> {
+        match value {
+            1 => Ok(MessageField::Data),
+            2 => Ok(MessageField::Cmd),
+            3 => Ok(MessageField::Mark),
+            4 => Ok(MessageField::Status),
+            5 => Ok(MessageField::Error),
+            6 => Ok(MessageField::Ip),
+            7 => Ok(MessageField::Port),
+            0 => Ok(MessageField::Random1),
+            39 => Ok(MessageField::Random2),
+            _ => Err(NeoError::Other(format!("Invalid message field value: {}", value))),
+        }
+    }
+}
 const CHANNEL_CAPACITY: usize = 1024;
 const BUFFER_SIZE: usize = 1024;
 const TIMEOUT_MS: u64 = 10;
@@ -74,7 +104,8 @@ impl From<base64::DecodeError> for NeoError {
 }
 
 // 类型别名
-pub type BlvMap = HashMap<i32, Vec<u8>>;
+pub type BlvMap = HashMap<i32, Vec<u8>>;  // 保持i32类型以便与现有代码兼容
+
 // 全局会话存储
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 
@@ -170,8 +201,8 @@ impl Codec {
         let mut data = Vec::new();
         let mut info = info.clone();
 
-        info.insert(0, Self::rand_byte());
-        info.insert(39, Self::rand_byte());
+        info.insert(MessageField::Random1.into(), Self::rand_byte());
+        info.insert(MessageField::Random2.into(), Self::rand_byte());
 
         for (&b, v) in &info {
             let l = v.len() as i32 + BLV_OFFSET;
@@ -370,13 +401,13 @@ fn write_reponse(request: tiny_http::Request, content: Vec<u8>) {
 
 // 辅助函数：设置失败响应
 fn set_failure_response(rinfo: &mut BlvMap, error_msg: impl Into<Vec<u8>>) {
-    rinfo.insert(STATUS, b"FAIL".to_vec());
-    rinfo.insert(ERROR, error_msg.into());
+    rinfo.insert(MessageField::Status.into(), b"FAIL".to_vec());
+    rinfo.insert(MessageField::Error.into(), error_msg.into());
 }
 
 // 辅助函数：从info中获取字符串值
-fn get_info_string_from_key(info: &BlvMap, key: &i32) -> String {
-    info.get(key)
+fn get_info_string_from_key(info: &BlvMap, field: MessageField) -> String {
+    info.get(&field.into())
         .map(|v| String::from_utf8_lossy(v).into_owned())
         .unwrap_or_default()
 }
@@ -388,15 +419,15 @@ async fn handle_connect(
     sessions: &Sessions,
     rinfo: &mut BlvMap,
 ) {
-    let ip = get_info_string_from_key(info, &IP);
-    let port_str = get_info_string_from_key(info, &PORT);
+    let ip = get_info_string_from_key(info, MessageField::Ip);
+    let port_str = get_info_string_from_key(info, MessageField::Port);
     let target_addr = format!("{}:{}", ip, port_str);
 
     match target_addr.parse::<SocketAddr>() {
         Ok(addr) => match TcpStream::connect_timeout(&addr, Duration::from_millis(CONNECTION_TIMEOUT_MS)) {
             Ok(conn) => {
                 sessions.lock().await.insert(mark.to_string(), Session::new(conn));
-                rinfo.insert(STATUS, b"OK".to_vec());
+                rinfo.insert(MessageField::Status.into(), b"OK".to_vec());
             }
             Err(e) => {
                 set_failure_response(rinfo, e.to_string().into_bytes());
@@ -417,10 +448,10 @@ async fn handle_forward(
 ) {
     let mut sessions = sessions.lock().await;
     if let Some(session) = sessions.get_mut(mark) {
-        if let Some(data) = info.get(&DATA) {
+        if let Some(data) = info.get(&MessageField::Data.into()) {
             match session.write_async(data).await {
                 Ok(_) => {
-                    rinfo.insert(STATUS, b"OK".to_vec());
+                    rinfo.insert(MessageField::Status.into(), b"OK".to_vec());
                 }
                 Err(e) => {
                     set_failure_response(rinfo, e.to_string().into_bytes());
@@ -450,10 +481,10 @@ async fn handle_read(
             if session.is_closed().await {
                 set_failure_response(rinfo, b"Session is closed".to_vec());
             } else {
-                rinfo.insert(STATUS, b"OK".to_vec());
+                rinfo.insert(MessageField::Status.into(), b"OK".to_vec());
                 match session.read_async().await {
                     Ok(data) if !data.is_empty() => {
-                        rinfo.insert(DATA, data);
+                        rinfo.insert(MessageField::Data.into(), data);
                     }
                     Ok(_) => {
                         // Data is empty, do nothing
@@ -481,7 +512,7 @@ async fn handle_disconnect(
     if let Some(session) = sessions.remove(mark) {
         session.close().await;
     }
-    rinfo.insert(STATUS, b"OK".to_vec());
+    rinfo.insert(MessageField::Status.into(), b"OK".to_vec());
 }
 
 // 主请求处理函数
@@ -493,13 +524,11 @@ async fn handle_request(
     let neoreg_hello = NEO_HELLO;
     let decoded_hello = codec.base64_decode(neoreg_hello).unwrap_or_default();
 
-    // 读取请求数据
     let mut data = Vec::new();
     if let Err(_) = request.as_reader().read_to_end(&mut data) {
         write_reponse(request, decoded_hello.to_vec());
         return Ok(());
     }
-
     // 解码数据
     let out = match codec.base64_decode(&data) {
         Ok(out) if !out.is_empty() => out,
@@ -509,15 +538,13 @@ async fn handle_request(
         }
     };
 
-    // 解析BLV格式数据
     let info = codec.blv_decode(&out);
 
-    // 准备响应数据
     let mut rinfo = HashMap::new();
 
     // 提取命令和标记
-    let cmd = get_info_string_from_key(&info, &CMD);
-    let mark = get_info_string_from_key(&info, &MARK);
+    let cmd = get_info_string_from_key(&info, MessageField::Cmd);
+    let mark = get_info_string_from_key(&info, MessageField::Mark);
 
     // 根据命令类型分发处理
     match cmd.as_str() {
@@ -526,6 +553,10 @@ async fn handle_request(
         "READ" => handle_read(&mark, &sessions, &mut rinfo).await,
         "DISCONNECT" => handle_disconnect(&mark, &sessions, &mut rinfo).await,
         _ => {
+            // let response =
+            //     tiny_http::Response::from_string(String::from_utf8_lossy(&decoded_hello))
+            //         .with_status_code(200);
+            // let _ = request.respond(response);
             write_reponse(request, decoded_hello.to_vec());
             return Ok(());
         }
